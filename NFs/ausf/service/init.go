@@ -1,0 +1,182 @@
+// SPDX-FileCopyrightText: 2025 Canonical Ltd
+// SPDX-FileCopyrightText: 2024 Intel Corporation
+// SPDX-FileCopyrightText: 2021 Open Networking Foundation <info@opennetworking.org>
+// Copyright 2019 free5GC.org
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+package service
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/omec-project/ausf/callback"
+	"github.com/omec-project/ausf/consumer"
+	ausfContext "github.com/omec-project/ausf/context"
+	"github.com/omec-project/ausf/factory"
+	"github.com/omec-project/ausf/logger"
+	"github.com/omec-project/ausf/metrics"
+	"github.com/omec-project/ausf/nfregistration"
+	"github.com/omec-project/ausf/polling"
+	"github.com/omec-project/ausf/ueauthentication"
+	"github.com/omec-project/openapi/v2/models"
+	nrfCache "github.com/omec-project/openapi/v2/nrfcache"
+	"github.com/omec-project/util/http2_util"
+	utilLogger "github.com/omec-project/util/logger"
+	"github.com/urfave/cli/v3"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+type AUSF struct{}
+
+type (
+	// Config information.
+	Config struct {
+		cfg string
+	}
+)
+
+var config Config
+
+var ausfCLi = []cli.Flag{
+	&cli.StringFlag{
+		Name:     "cfg",
+		Usage:    "ausf config file",
+		Required: true,
+	},
+}
+
+func (ausf *AUSF) GetCliCmd() (flags []cli.Flag) {
+	return ausfCLi
+}
+
+func (ausf *AUSF) Initialize(c *cli.Command) error {
+	config = Config{
+		cfg: c.String("cfg"),
+	}
+
+	absPath, err := filepath.Abs(config.cfg)
+	if err != nil {
+		logger.CfgLog.Errorln(err)
+		return err
+	}
+
+	if err := factory.InitConfigFactory(absPath); err != nil {
+		return err
+	}
+
+	ausf.setLogLevel()
+
+	if err := factory.CheckConfigVersion(); err != nil {
+		return err
+	}
+
+	factory.AusfConfig.CfgLocation = absPath
+	ausfContext.Init()
+	return nil
+}
+
+func (ausf *AUSF) setLogLevel() {
+	if factory.AusfConfig.Logger == nil {
+		logger.InitLog.Warnln("AUSF config without log level setting")
+		return
+	}
+
+	if factory.AusfConfig.Logger.AUSF != nil {
+		if factory.AusfConfig.Logger.AUSF.DebugLevel != "" {
+			if level, err := zapcore.ParseLevel(factory.AusfConfig.Logger.AUSF.DebugLevel); err != nil {
+				logger.InitLog.Warnf("AUSF Log level [%s] is invalid, set to [info] level",
+					factory.AusfConfig.Logger.AUSF.DebugLevel)
+				logger.SetLogLevel(zap.InfoLevel)
+			} else {
+				logger.InitLog.Infof("AUSF Log level is set to [%s] level", level)
+				logger.SetLogLevel(level)
+			}
+		} else {
+			logger.InitLog.Warnln("AUSF Log level not set. Default set to [info] level")
+			logger.SetLogLevel(zap.InfoLevel)
+		}
+	}
+}
+
+func (ausf *AUSF) Start() {
+	logger.InitLog.Infoln("server started")
+
+	router := utilLogger.NewGinWithZap(logger.GinLog)
+	ueauthentication.AddService(router)
+	callback.AddService(router)
+
+	go metrics.InitMetrics()
+
+	self := ausfContext.GetSelf()
+	addr := fmt.Sprintf("%s:%d", self.BindingIPv4, self.SBIPort)
+
+	if self.EnableNrfCaching {
+		logger.InitLog.Infoln("enable NRF caching feature")
+		nrfCache.InitNrfCaching(self.NrfCacheEvictionInterval*time.Second, consumer.SendNfDiscoveryToNrfCacheQuery)
+	}
+
+	plmnConfigChan := make(chan []models.PlmnId, 1)
+	ctx, cancelServices := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		polling.StartPollingService(ctx, factory.AusfConfig.Configuration.WebuiUri, plmnConfigChan)
+	}()
+	go func() {
+		defer wg.Done()
+		nfregistration.StartNfRegistrationService(ctx, plmnConfigChan)
+	}()
+
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signalChannel
+		ausf.Terminate(cancelServices, &wg)
+		os.Exit(0)
+	}()
+
+	sslLog := filepath.Dir(factory.AusfConfig.CfgLocation) + "/sslkey.log"
+	server, err := http2_util.NewServer(addr, sslLog, router)
+	if server == nil {
+		logger.InitLog.Errorf("initialize HTTP server failed: %v", err)
+		return
+	}
+
+	if err != nil {
+		logger.InitLog.Warnf("initialize HTTP server: %v", err)
+	}
+
+	serverScheme := factory.AusfConfig.Configuration.Sbi.Scheme
+	switch serverScheme {
+	case "http":
+		err = server.ListenAndServe()
+	case "https":
+		err = server.ListenAndServeTLS(self.PEM, self.Key)
+	default:
+		logger.InitLog.Fatalf("HTTP server setup failed: invalid server scheme %+v", serverScheme)
+		return
+	}
+
+	if err != nil {
+		logger.InitLog.Fatalf("HTTP server setup failed: %+v", err)
+	}
+}
+
+func (ausf *AUSF) Terminate(cancelServices context.CancelFunc, wg *sync.WaitGroup) {
+	logger.InitLog.Infof("terminating AUSF")
+	cancelServices()
+	nfregistration.DeregisterNF()
+	wg.Wait()
+	logger.InitLog.Infoln("AUSF terminated")
+}

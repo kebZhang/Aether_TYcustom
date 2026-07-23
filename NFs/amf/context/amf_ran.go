@@ -1,0 +1,257 @@
+// SPDX-FileCopyrightText: 2022-present Intel Corporation
+// SPDX-FileCopyrightText: 2021 Open Networking Foundation <info@opennetworking.org>
+// Copyright 2019 free5GC.org
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+package context
+
+import (
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+
+	"github.com/omec-project/amf/factory"
+	"github.com/omec-project/amf/logger"
+	"github.com/omec-project/amf/metrics"
+	"github.com/omec-project/amf/protos/sdcoreAmfServer"
+	"github.com/omec-project/ngap/v2/ngapConvert"
+	"github.com/omec-project/ngap/v2/ngapType"
+	"github.com/omec-project/openapi/v2/models"
+	mi "github.com/omec-project/util/metricinfo"
+	"go.uber.org/zap"
+)
+
+const (
+	RanPresentGNbId   = 1
+	RanPresentNgeNbId = 2
+	RanPresentN3IwfId = 3
+	RanConnected      = "Connected"
+	RanDisconnected   = "Disconnected"
+)
+
+type AmfRan struct {
+	RanPresent int
+	RanId      *models.GlobalRanNodeId
+	Name       string
+	AnType     models.AccessType
+	GnbIp      string `json:"-"` // TODO to be removed
+	GnbId      string // RanId in string format, i.e.,mcc:mnc:gnbid
+	/* socket Connect*/
+	Conn net.Conn `json:"-"`
+	/* Supported TA List */
+	SupportedTAList []SupportedTAI // TODO SupportedTaList store and recover from DB
+
+	/* RAN UE List */
+	RanUeList []*RanUe `json:"-"` // RanUeNgapId as key
+
+	Amf2RanMsgChan chan *sdcoreAmfServer.AmfMessage `json:"-"`
+	/* logger */
+	Log *zap.SugaredLogger `json:"-"`
+
+	ranStateMu sync.RWMutex
+}
+
+type SupportedTAI struct {
+	Tai        models.Tai
+	SNssaiList []models.Snssai
+}
+
+func NewSupportedTAI() (tai SupportedTAI) {
+	tai.SNssaiList = make([]models.Snssai, 0, MaxNumOfSlice)
+	return
+}
+
+func NewSupportedTAIList() []SupportedTAI {
+	return make([]SupportedTAI, 0, maxNumOfTAI*maxNumOfBroadcastPLMNs)
+}
+
+func (ran *AmfRan) Remove() {
+	// send nf(gnb) status notification
+	gnbStatus := mi.MetricEvent{
+		EventType: mi.CNfStatusEvt,
+		NfStatusData: mi.CNfStatus{
+			NfType:   mi.NfTypeGnb,
+			NfStatus: mi.NfStatusDisconnected, NfName: ran.GnbId,
+		},
+	}
+	if *factory.AmfConfig.Configuration.KafkaInfo.EnableKafka {
+		if err := metrics.StatWriter.PublishNfStatusEvent(gnbStatus); err != nil {
+			ran.Log.Errorf("could not publish NfStatusEvent: %v", err)
+		}
+	}
+
+	ran.SetRanStats(RanDisconnected)
+	ran.Log.Infof("remove RAN Context[ID: %+v]", ran.RanID())
+	ran.RemoveAllUeInRan()
+	if AMF_Self().EnableSctpLb {
+		if ran.GnbId != "" {
+			AMF_Self().DeleteAmfRanId(ran.GnbId)
+		}
+	} else {
+		AMF_Self().DeleteAmfRan(ran.Conn)
+	}
+}
+
+func (ran *AmfRan) NewRanUe(ranUeNgapID int64) (*RanUe, error) {
+	ranUe := RanUe{}
+	self := AMF_Self()
+	amfUeNgapID, err := self.AllocateAmfUeNgapID()
+	if err != nil {
+		ran.Log.Errorln("alloc Amf ue ngap id failed", err)
+		return nil, fmt.Errorf("allocate AMF UE NGAP ID error: %+v", err)
+	}
+	ranUe.AmfUeNgapId = amfUeNgapID
+	ranUe.RanUeNgapId = ranUeNgapID
+	ranUe.Ran = ran
+	ranUe.Log = ran.Log.With(logger.FieldAmfUeNgapID, fmt.Sprintf("AMF_UE_NGAP_ID:%d", ranUe.AmfUeNgapId))
+	ran.RanUeList = append(ran.RanUeList, &ranUe)
+	self.RanUePool.Store(ranUe.AmfUeNgapId, &ranUe)
+	return &ranUe, nil
+}
+
+func (ran *AmfRan) RemoveAllUeInRan() {
+	for _, ranUe := range ran.RanUeList {
+		if err := ranUe.Remove(); err != nil {
+			logger.ContextLog.Errorf("Remove RanUe error: %v", err)
+		}
+	}
+}
+
+func (ran *AmfRan) RanUeFindByRanUeNgapIDLocal(ranUeNgapID int64) *RanUe {
+	// TODO - need fix..Make this map so search is fast
+	for _, ranUe := range ran.RanUeList {
+		if ranUe.RanUeNgapId == ranUeNgapID {
+			return ranUe
+		}
+	}
+	ran.Log.Infof("RanUe does not exist")
+	return nil
+}
+
+func (ran *AmfRan) RanUeFindByRanUeNgapID(ranUeNgapID int64) *RanUe {
+	ranUe := ran.RanUeFindByRanUeNgapIDLocal(ranUeNgapID)
+
+	if ranUe != nil {
+		return ranUe
+	}
+
+	if AMF_Self().EnableDbStore {
+		ranUe := DbFetchRanUeByRanUeNgapID(ranUeNgapID, ran)
+		if ranUe != nil {
+			ranUe.Ran = ran
+			ran.RanUeList = append(ran.RanUeList, ranUe)
+			return ranUe
+		}
+	}
+
+	return nil
+}
+
+func (ran *AmfRan) SetRanId(ranNodeId *ngapType.GlobalRANNodeID) error {
+	ranId, err := ngapConvert.RanIdToModels(*ranNodeId)
+	if err != nil {
+		return fmt.Errorf("set RanId failed: %w", err)
+	}
+	ran.RanPresent = ranNodeId.Present
+	ran.RanId = &ranId
+
+	// Setting RanId in String format with ":" separation of each field
+	if ranId.PlmnId.GetMcc() != "" && ranId.PlmnId.GetMnc() != "" {
+		ran.GnbId = ranId.PlmnId.Mcc + ":" + ranId.PlmnId.Mnc + ":"
+	}
+	if ranNodeId.Present == ngapType.GlobalRANNodeIDPresentGlobalN3IWFID {
+		ran.AnType = models.ACCESSTYPE_NON_3_GPP_ACCESS
+		ran.GnbId += ranId.GetN3IwfId()
+	} else {
+		ran.AnType = models.ACCESSTYPE__3_GPP_ACCESS
+		if ranId.GNbId != nil {
+			ran.GnbId += ranId.GNbId.GNBValue
+		}
+	}
+	ran.Log.Debugf("set RanId: %+v, GnbId: %s, AnType: %s", ran.RanId, ran.GnbId, ran.AnType)
+	return nil
+}
+
+func (ran *AmfRan) LockRanState() {
+	ran.ranStateMu.Lock()
+}
+
+func (ran *AmfRan) UnlockRanState() {
+	ran.ranStateMu.Unlock()
+}
+
+func (ran *AmfRan) RLockRanState() {
+	ran.ranStateMu.RLock()
+}
+
+func (ran *AmfRan) RUnlockRanState() {
+	ran.ranStateMu.RUnlock()
+}
+
+type ranStatsSnapshot struct {
+	name            string
+	gnbIP           string
+	supportedTAList []SupportedTAI
+}
+
+func (ran *AmfRan) statsSnapshot() ranStatsSnapshot {
+	ran.RLockRanState()
+	defer ran.RUnlockRanState()
+
+	snapshot := ranStatsSnapshot{
+		name:  ran.Name,
+		gnbIP: ran.GnbIp,
+	}
+
+	if len(ran.SupportedTAList) == 0 {
+		return snapshot
+	}
+
+	snapshot.supportedTAList = make([]SupportedTAI, len(ran.SupportedTAList))
+	copy(snapshot.supportedTAList, ran.SupportedTAList)
+	return snapshot
+}
+
+func (ran *AmfRan) SupportedTAListSnapshot() []SupportedTAI {
+	return ran.statsSnapshot().supportedTAList
+}
+
+func (ran *AmfRan) ConvertGnbIdToRanId(gnbId string) (ranNodeId *models.GlobalRanNodeId) {
+	ranId := models.NewGlobalRanNodeIdWithDefaults()
+	val := strings.Split(gnbId, ":")
+	if len(val) != 3 {
+		return nil
+	}
+	ranId.PlmnId = models.PlmnId{Mcc: val[0], Mnc: val[1]}
+	ranId.GNbId = models.NewGNbIdWithDefaults()
+	ranId.GNbId.SetGNBValue(val[2])
+	ran.RanPresent = RanPresentGNbId
+	return ranId
+}
+
+func (ran *AmfRan) RanID() string {
+	switch ran.RanPresent {
+	case RanPresentGNbId:
+		return fmt.Sprintf("<PlmnID: %+v, GNbID: %s>", ran.RanId.GetPlmnId(), ran.RanId.GNbId.GetGNBValue())
+	case RanPresentN3IwfId:
+		return fmt.Sprintf("<PlmnID: %+v, N3IwfID: %s>", ran.RanId.GetPlmnId(), ran.RanId.GetN3IwfId())
+	case RanPresentNgeNbId:
+		return fmt.Sprintf("<PlmnID: %+v, NgeNbID: %s>", ran.RanId.GetPlmnId(), ran.RanId.GetNgeNbId())
+	default:
+		return ""
+	}
+}
+
+func (ran *AmfRan) SetRanStats(state string) {
+	snapshot := ran.statsSnapshot()
+	for _, tai := range snapshot.supportedTAList {
+		if state == RanConnected {
+			metrics.SetGnbSessProfileStats(snapshot.name, snapshot.gnbIP, state, tai.Tai.Tac, 1)
+		} else {
+			metrics.SetGnbSessProfileStats(snapshot.name, snapshot.gnbIP, state, tai.Tai.Tac, 0)
+		}
+	}
+}

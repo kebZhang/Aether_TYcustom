@@ -1,0 +1,801 @@
+// Copyright 2019 free5GC.org
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+package message
+
+import (
+	"os"
+
+	"github.com/omec-project/amf/context"
+	"github.com/omec-project/amf/logger"
+	"github.com/omec-project/amf/producer/callback"
+	"github.com/omec-project/amf/protos/sdcoreAmfServer"
+	"github.com/omec-project/ngap/v2/aper"
+	"github.com/omec-project/ngap/v2/ngapType"
+	"github.com/omec-project/openapi/v2/models"
+)
+
+func SendToRan(ran *context.AmfRan, packet []byte) {
+	defer func() {
+		err := recover()
+		if err != nil {
+			logger.NgapLog.Warnf("send error, gNB may have been lost: %+v", err)
+		}
+	}()
+
+	if ran == nil {
+		logger.NgapLog.Errorln("Ran is nil")
+		return
+	}
+
+	if len(packet) == 0 {
+		ran.Log.Errorln("packet len is 0")
+		return
+	}
+
+	if context.AMF_Self().EnableSctpLb {
+		msg := &sdcoreAmfServer.AmfMessage{VerboseMsg: "Message from AMF"}
+		msg.Msg = packet
+		msg.Msgtype = sdcoreAmfServer.MsgType_AMF_MSG
+		msg.AmfId = os.Getenv("HOSTNAME")
+		msg.GnbIpAddr = ran.GnbIp
+		msg.GnbId = ran.GnbId
+		ran.Amf2RanMsgChan <- msg
+	} else {
+		if ran.Conn == nil {
+			ran.Log.Errorln("Ran conn is nil")
+			return
+		}
+
+		if ran.Conn.RemoteAddr() == nil {
+			ran.Log.Errorln("Ran addr is nil")
+			return
+		}
+
+		ran.Log.Debugln("send NGAP message To Ran")
+
+		if n, err := ran.Conn.Write(packet); err != nil {
+			ran.Log.Errorf("send error: %+v", err)
+			return
+		} else {
+			ran.Log.Debugf("Write %d bytes", n)
+		}
+	}
+}
+
+func SendToRanUe(ue *context.RanUe, packet []byte) {
+	var ran *context.AmfRan
+
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	if ran = ue.Ran; ran == nil {
+		logger.NgapLog.Errorln("Ran is nil")
+		return
+	}
+
+	if ue.AmfUe == nil {
+		ue.Log.Warnln("AmfUe is nil")
+	}
+
+	SendToRan(ran, packet)
+}
+
+func NasSendToRan(ue *context.AmfUe, accessType models.AccessType, packet []byte) {
+	if ue == nil {
+		logger.NgapLog.Errorln("AmfUe is nil")
+		return
+	}
+
+	ranUe := ue.RanUe[accessType]
+	if ranUe == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	SendToRanUe(ranUe, packet)
+}
+
+func SendNGSetupResponse(ran *context.AmfRan) {
+	ran.Log.Infoln("send NG-Setup response")
+
+	pkt, err := BuildNGSetupResponse()
+	if err != nil {
+		ran.Log.Errorf("build NGSetupResponse failed: %s", err.Error())
+		return
+	}
+	ran.SetRanStats(context.RanConnected)
+	SendToRan(ran, pkt)
+}
+
+func SendNGSetupFailure(ran *context.AmfRan, cause ngapType.Cause) {
+	ran.Log.Infoln("send NG-Setup failure")
+
+	if cause.Present == ngapType.CausePresentNothing {
+		ran.Log.Errorln("cause present is nil")
+		return
+	}
+
+	pkt, err := BuildNGSetupFailure(cause)
+	if err != nil {
+		ran.Log.Errorf("build NGSetupFailure failed: %s", err.Error())
+		return
+	}
+	SendToRan(ran, pkt)
+}
+
+func SendNGResetAcknowledge(ran *context.AmfRan, partOfNGInterface *ngapType.UEAssociatedLogicalNGConnectionList,
+	criticalityDiagnostics *ngapType.CriticalityDiagnostics,
+) {
+	ran.Log.Infoln("send NG Reset Acknowledge")
+
+	if partOfNGInterface != nil && len(partOfNGInterface.List) == 0 {
+		ran.Log.Errorln("length of partOfNGInterface is 0")
+		return
+	}
+
+	pkt, err := BuildNGResetAcknowledge(partOfNGInterface, criticalityDiagnostics)
+	if err != nil {
+		ran.Log.Errorf("build NGResetAcknowledge failed: %s", err.Error())
+		return
+	}
+	SendToRan(ran, pkt)
+}
+
+func SendDownlinkNasTransport(ue *context.RanUe, nasPdu []byte,
+	mobilityRestrictionList *ngapType.MobilityRestrictionList,
+) {
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	ue.Log.Infoln("send Downlink Nas Transport")
+
+	if len(nasPdu) == 0 {
+		ue.Log.Errorln("send DownlinkNasTransport Error: nasPdu is nil")
+	}
+
+	pkt, err := BuildDownlinkNasTransport(ue, nasPdu, mobilityRestrictionList)
+	if err != nil {
+		ue.Log.Errorf("build DownlinkNasTransport failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(ue, pkt)
+}
+
+func SendPDUSessionResourceReleaseCommand(ue *context.RanUe, nasPdu []byte,
+	pduSessionResourceReleasedList ngapType.PDUSessionResourceToReleaseListRelCmd,
+) {
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	ue.Log.Infoln("send PDU Session Resource Release Command")
+
+	pkt, err := BuildPDUSessionResourceReleaseCommand(ue, nasPdu, pduSessionResourceReleasedList)
+	if err != nil {
+		ue.Log.Errorf("build PDUSessionResourceReleaseCommand failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(ue, pkt)
+}
+
+func SendUEContextReleaseCommand(ue *context.RanUe, action context.RelAction, causePresent int, cause aper.Enumerated) {
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	ue.Log.Infoln("send UE Context Release Command")
+
+	pkt, err := BuildUEContextReleaseCommand(ue, causePresent, cause)
+	if err != nil {
+		ue.Log.Errorf("build UEContextReleaseCommand failed: %s", err.Error())
+		return
+	}
+	ue.ReleaseAction = action
+	if ue.AmfUe != nil && ue.Ran != nil {
+		ue.AmfUe.ReleaseCause[ue.Ran.AnType] = &context.CauseAll{
+			NgapCause: &models.NgApCause{
+				Group: int32(causePresent),
+				Value: int32(cause),
+			},
+		}
+	}
+	SendToRanUe(ue, pkt)
+}
+
+func SendErrorIndication(ran *context.AmfRan, amfUeNgapId, ranUeNgapId *int64, cause *ngapType.Cause,
+	criticalityDiagnostics *ngapType.CriticalityDiagnostics,
+) {
+	if ran == nil {
+		logger.NgapLog.Errorln("Ran is nil")
+		return
+	}
+
+	ran.Log.Infoln("send Error Indication")
+
+	pkt, err := BuildErrorIndication(amfUeNgapId, ranUeNgapId, cause, criticalityDiagnostics)
+	if err != nil {
+		ran.Log.Errorf("build ErrorIndication failed: %s", err.Error())
+		return
+	}
+	SendToRan(ran, pkt)
+}
+
+func SendHandoverCancelAcknowledge(ue *context.RanUe, criticalityDiagnostics *ngapType.CriticalityDiagnostics) {
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	ue.Log.Infoln("send Handover Cancel Acknowledge")
+
+	pkt, err := BuildHandoverCancelAcknowledge(ue, criticalityDiagnostics)
+	if err != nil {
+		ue.Log.Errorf("build HandoverCancelAcknowledge failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(ue, pkt)
+}
+
+// nasPDU: from nas layer
+// pduSessionResourceSetupRequestList: provided by AMF, and transfer data is from SMF
+func SendPDUSessionResourceSetupRequest(ue *context.RanUe, nasPdu []byte,
+	pduSessionResourceSetupRequestList ngapType.PDUSessionResourceSetupListSUReq,
+) {
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	ue.Log.Infoln("send PDU Session Resource Setup Request")
+
+	if len(pduSessionResourceSetupRequestList.List) > context.MaxNumOfPDUSessions {
+		ue.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	pkt, err := BuildPDUSessionResourceSetupRequest(ue, nasPdu, pduSessionResourceSetupRequestList)
+	if err != nil {
+		ue.Log.Errorf("build PDUSessionResourceSetupRequest failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(ue, pkt)
+}
+
+// pduSessionResourceModifyConfirmList: provided by AMF, and transfer data is return from SMF
+// pduSessionResourceFailedToModifyList: provided by AMF, and transfer data is return from SMF
+func SendPDUSessionResourceModifyConfirm(
+	ue *context.RanUe,
+	pduSessionResourceModifyConfirmList ngapType.PDUSessionResourceModifyListModCfm,
+	pduSessionResourceFailedToModifyList ngapType.PDUSessionResourceFailedToModifyListModCfm,
+	criticalityDiagnostics *ngapType.CriticalityDiagnostics,
+) {
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	ue.Log.Infoln("send PDU Session Resource Modify Confirm")
+
+	if len(pduSessionResourceModifyConfirmList.List) > context.MaxNumOfPDUSessions {
+		ue.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	if len(pduSessionResourceFailedToModifyList.List) > context.MaxNumOfPDUSessions {
+		ue.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	pkt, err := BuildPDUSessionResourceModifyConfirm(ue, pduSessionResourceModifyConfirmList,
+		pduSessionResourceFailedToModifyList, criticalityDiagnostics)
+	if err != nil {
+		ue.Log.Errorf("build PDUSessionResourceModifyConfirm failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(ue, pkt)
+}
+
+// pduSessionResourceModifyRequestList: from SMF
+func SendPDUSessionResourceModifyRequest(ue *context.RanUe,
+	pduSessionResourceModifyRequestList ngapType.PDUSessionResourceModifyListModReq,
+) {
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	ue.Log.Infoln("send PDU Session Resource Modify Request")
+
+	if len(pduSessionResourceModifyRequestList.List) > context.MaxNumOfPDUSessions {
+		ue.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	pkt, err := BuildPDUSessionResourceModifyRequest(ue, pduSessionResourceModifyRequestList)
+	if err != nil {
+		ue.Log.Errorf("build PDUSessionResourceModifyRequest failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(ue, pkt)
+}
+
+func SendInitialContextSetupRequest(
+	amfUe *context.AmfUe,
+	anType models.AccessType,
+	nasPdu []byte,
+	pduSessionResourceSetupRequestList *ngapType.PDUSessionResourceSetupListCxtReq,
+	rrcInactiveTransitionReportRequest *ngapType.RRCInactiveTransitionReportRequest,
+	coreNetworkAssistanceInfo *ngapType.CoreNetworkAssistanceInformationForInactive,
+	emergencyFallbackIndicator *ngapType.EmergencyFallbackIndicator,
+) {
+	if amfUe == nil {
+		logger.NgapLog.Errorln("AmfUe is nil")
+		return
+	}
+
+	amfUe.RanUe[anType].Log.Infoln("send Initial Context Setup Request")
+
+	if pduSessionResourceSetupRequestList != nil {
+		if len(pduSessionResourceSetupRequestList.List) > context.MaxNumOfPDUSessions {
+			amfUe.RanUe[anType].Log.Errorln("Pdu List out of range")
+			return
+		}
+	}
+
+	pkt, err := BuildInitialContextSetupRequest(amfUe, anType, nasPdu, pduSessionResourceSetupRequestList,
+		rrcInactiveTransitionReportRequest, coreNetworkAssistanceInfo, emergencyFallbackIndicator)
+	if err != nil {
+		amfUe.RanUe[anType].Log.Errorf("build InitialContextSetupRequest failed: %s", err.Error())
+		return
+	}
+	amfUe.RanUe[anType].SentInitialContextSetupRequest = true
+	NasSendToRan(amfUe, anType, pkt)
+}
+
+// pduSessionResourceHandoverList: provided by amf and transfer is return from smf
+// pduSessionResourceToReleaseList: provided by amf and transfer is return from smf
+// criticalityDiagnostics = criticalityDiagonstics IE in receiver node's error indication
+// when received node can't comprehend the IE or missing IE
+func SendHandoverCommand(
+	sourceUe *context.RanUe,
+	pduSessionResourceHandoverList ngapType.PDUSessionResourceHandoverList,
+	pduSessionResourceToReleaseList ngapType.PDUSessionResourceToReleaseListHOCmd,
+	container ngapType.TargetToSourceTransparentContainer,
+	criticalityDiagnostics *ngapType.CriticalityDiagnostics,
+) {
+	if sourceUe == nil {
+		logger.NgapLog.Errorln("SourceUe is nil")
+		return
+	}
+
+	sourceUe.Log.Infoln("send Handover Command")
+
+	if len(pduSessionResourceHandoverList.List) > context.MaxNumOfPDUSessions {
+		sourceUe.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	if len(pduSessionResourceToReleaseList.List) > context.MaxNumOfPDUSessions {
+		sourceUe.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	pkt, err := BuildHandoverCommand(sourceUe, pduSessionResourceHandoverList, pduSessionResourceToReleaseList,
+		container, criticalityDiagnostics)
+	if err != nil {
+		sourceUe.Log.Errorf("build HandoverCommand failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(sourceUe, pkt)
+}
+
+// cause = initiate the Handover Cancel procedure with the appropriate value for the Cause IE.
+// criticalityDiagnostics = criticalityDiagonstics IE in receiver node's error indication
+// when received node can't comprehend the IE or missing IE
+func SendHandoverPreparationFailure(sourceUe *context.RanUe, cause ngapType.Cause,
+	criticalityDiagnostics *ngapType.CriticalityDiagnostics,
+) {
+	if sourceUe == nil {
+		logger.NgapLog.Errorln("SourceUe is nil")
+		return
+	}
+
+	sourceUe.Log.Infoln("send Handover Preparation Failure")
+
+	amfUe := sourceUe.AmfUe
+	if amfUe == nil {
+		sourceUe.Log.Errorln("amfUe is nil")
+		return
+	}
+	amfUe.SetOnGoing(sourceUe.Ran.AnType, &context.OnGoingProcedureWithPrio{
+		Procedure: context.OnGoingProcedureNothing,
+	})
+	pkt, err := BuildHandoverPreparationFailure(sourceUe, cause, criticalityDiagnostics)
+	if err != nil {
+		sourceUe.Log.Errorf("build HandoverPreparationFailure failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(sourceUe, pkt)
+}
+
+/*The PGW-C+SMF (V-SMF in the case of home-routed roaming scenario only) sends
+a Nsmf_PDUSession_CreateSMContext Response(N2 SM Information (PDU Session ID, cause code)) to the AMF.*/
+// Cause is from SMF
+// pduSessionResourceSetupList provided by AMF, and the transfer data is from SMF
+// sourceToTargetTransparentContainer is received from S-RAN
+// nsci: new security context indicator, if amfUe has updated security context, set nsci to true, otherwise set to false
+// N2 handover in same AMF
+func SendHandoverRequest(sourceUe *context.RanUe, targetRan *context.AmfRan, cause ngapType.Cause,
+	pduSessionResourceSetupListHOReq ngapType.PDUSessionResourceSetupListHOReq,
+	sourceToTargetTransparentContainer ngapType.SourceToTargetTransparentContainer, nsci bool,
+) {
+	if sourceUe == nil {
+		logger.NgapLog.Errorln("sourceUe is nil")
+		return
+	}
+
+	sourceUe.Log.Infoln("send Handover Request")
+
+	amfUe := sourceUe.AmfUe
+	if amfUe == nil {
+		sourceUe.Log.Errorln("amfUe is nil")
+		return
+	}
+	if targetRan == nil {
+		sourceUe.Log.Errorln("targetRan is nil")
+		return
+	}
+
+	if sourceUe.TargetUe != nil {
+		sourceUe.Log.Errorln("Handover Required Duplicated")
+		return
+	}
+
+	if len(pduSessionResourceSetupListHOReq.List) > context.MaxNumOfPDUSessions {
+		sourceUe.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	if len(sourceToTargetTransparentContainer.Value) == 0 {
+		sourceUe.Log.Errorln("Source To Target TransparentContainer is nil")
+		return
+	}
+
+	var targetUe *context.RanUe
+	if targetUeTmp, err := targetRan.NewRanUe(context.RanUeNgapIdUnspecified); err != nil {
+		sourceUe.Log.Errorf("create target UE error: %+v", err)
+	} else {
+		targetUe = targetUeTmp
+	}
+
+	sourceUe.Log.Debugf("source: AMF_UE_NGAP_ID[%d], RAN_UE_NGAP_ID[%d]", sourceUe.AmfUeNgapId, sourceUe.RanUeNgapId)
+	sourceUe.Log.Debugf("target: AMF_UE_NGAP_ID[%d], RAN_UE_NGAP_ID[Unknown]", targetUe.AmfUeNgapId)
+	context.AttachSourceUeTargetUe(sourceUe, targetUe)
+
+	pkt, err := BuildHandoverRequest(targetUe, cause, pduSessionResourceSetupListHOReq,
+		sourceToTargetTransparentContainer, nsci)
+	if err != nil {
+		sourceUe.Log.Errorf("build HandoverRequest failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(targetUe, pkt)
+}
+
+// pduSessionResourceSwitchedList: provided by AMF, and the transfer data is from SMF
+// pduSessionResourceReleasedList: provided by AMF, and the transfer data is from SMF
+// newSecurityContextIndicator: if AMF has activated a new 5G NAS security context, set it to true,
+// otherwise set to false
+// coreNetworkAssistanceInformation: provided by AMF, based on collection of UE behaviour statistics
+// and/or other available
+// information about the expected UE behaviour. TS 23.501 5.4.6, 5.4.6.2
+// rrcInactiveTransitionReportRequest: configured by amf
+// criticalityDiagnostics: from received node when received not comprehended IE or missing IE
+func SendPathSwitchRequestAcknowledge(
+	ue *context.RanUe,
+	pduSessionResourceSwitchedList ngapType.PDUSessionResourceSwitchedList,
+	pduSessionResourceReleasedList ngapType.PDUSessionResourceReleasedListPSAck,
+	newSecurityContextIndicator bool,
+	coreNetworkAssistanceInformation *ngapType.CoreNetworkAssistanceInformationForInactive,
+	rrcInactiveTransitionReportRequest *ngapType.RRCInactiveTransitionReportRequest,
+	criticalityDiagnostics *ngapType.CriticalityDiagnostics,
+) {
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	ue.Log.Infoln("send Path Switch Request Acknowledge")
+
+	if len(pduSessionResourceSwitchedList.List) > context.MaxNumOfPDUSessions {
+		ue.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	if len(pduSessionResourceReleasedList.List) > context.MaxNumOfPDUSessions {
+		ue.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	pkt, err := BuildPathSwitchRequestAcknowledge(ue, pduSessionResourceSwitchedList, pduSessionResourceReleasedList,
+		newSecurityContextIndicator, coreNetworkAssistanceInformation, rrcInactiveTransitionReportRequest,
+		criticalityDiagnostics)
+	if err != nil {
+		ue.Log.Errorf("build PathSwitchRequestAcknowledge failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(ue, pkt)
+}
+
+// pduSessionResourceReleasedList: provided by AMF, and the transfer data is from SMF
+// criticalityDiagnostics: from received node when received not comprehended IE or missing IE
+func SendPathSwitchRequestFailure(
+	ran *context.AmfRan,
+	amfUeNgapId,
+	ranUeNgapId int64,
+	pduSessionResourceReleasedList *ngapType.PDUSessionResourceReleasedListPSFail,
+	criticalityDiagnostics *ngapType.CriticalityDiagnostics,
+) {
+	ran.Log.Infoln("send Path Switch Request Failure")
+
+	if pduSessionResourceReleasedList != nil && len(pduSessionResourceReleasedList.List) > context.MaxNumOfPDUSessions {
+		ran.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	pkt, err := BuildPathSwitchRequestFailure(amfUeNgapId, ranUeNgapId, pduSessionResourceReleasedList,
+		criticalityDiagnostics)
+	if err != nil {
+		ran.Log.Errorf("build PathSwitchRequestFailure failed: %s", err.Error())
+		return
+	}
+	SendToRan(ran, pkt)
+}
+
+// RanStatusTransferTransparentContainer from Uplink Ran Configuration Transfer
+func SendDownlinkRanStatusTransfer(ue *context.RanUe, container ngapType.RANStatusTransferTransparentContainer) {
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	ue.Log.Infoln("send Downlink Ran Status Transfer")
+
+	if len(container.DRBsSubjectToStatusTransferList.List) > context.MaxNumOfDRBs {
+		ue.Log.Errorln("Pdu List out of range")
+		return
+	}
+
+	pkt, err := BuildDownlinkRanStatusTransfer(ue, container)
+	if err != nil {
+		ue.Log.Errorf("build DownlinkRanStatusTransfer failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(ue, pkt)
+}
+
+// anType indicate amfUe send this msg for which accessType
+// Paging Priority: is included only if the AMF receives an Namf_Communication_N1N2MessageTransfer message
+// with an ARP value associated with
+// priority services (e.g., MPS, MCS), as configured by the operator. (TS 23.502 4.2.3.3, TS 23.501 5.22.3)
+// pagingOriginNon3GPP: TS 23.502 4.2.3.3 step 4b: If the UE is simultaneously registered over 3GPP and non-3GPP
+// accesses in the same PLMN,
+// the UE is in CM-IDLE state in both 3GPP access and non-3GPP access, and the PDU Session ID in step 3a
+// is associated with non-3GPP access, the AMF sends a Paging message with associated access "non-3GPP" to
+// NG-RAN node(s) via 3GPP access.
+// more paging policy with 3gpp/non-3gpp access is described in TS 23.501 5.6.8
+func SendPaging(ue *context.AmfUe, ngapBuf []byte) {
+	// var pagingPriority *ngapType.PagingPriority
+	if ue == nil {
+		logger.NgapLog.Errorln("AmfUe is nil")
+		return
+	}
+
+	// if ppi != nil {
+	// pagingPriority = new(ngapType.PagingPriority)
+	// pagingPriority.Value = aper.Enumerated(*ppi)
+	// }
+	// pkt, err := BuildPaging(ue, pagingPriority, pagingOriginNon3GPP)
+	// if err != nil {
+	// 	ngaplog.Errorf("build Paging failed: %s", err.Error())
+	// }
+	taiList := ue.RegistrationArea[models.ACCESSTYPE__3_GPP_ACCESS]
+	context.AMF_Self().AmfRanPool.Range(func(key, value interface{}) bool {
+		ran := value.(*context.AmfRan)
+		for _, item := range ran.SupportedTAListSnapshot() {
+			if context.InTaiList(item.Tai, taiList) {
+				ue.GmmLog.Infof("send Paging to TAI(%+v, Tac:%+v)",
+					item.Tai.PlmnId, item.Tai.Tac)
+				SendToRan(ran, ngapBuf)
+				break
+			}
+		}
+		return true
+	})
+
+	if context.AMF_Self().T3513Cfg.Enable {
+		cfg := context.AMF_Self().T3513Cfg
+		ue.T3513 = context.NewTimer(cfg.ExpireTime, cfg.MaxRetryTimes, func(expireTimes int32) {
+			ue.GmmLog.Warnf("T3513 expires, retransmit Paging (retry: %d)", expireTimes)
+			context.AMF_Self().AmfRanPool.Range(func(key, value interface{}) bool {
+				ran := value.(*context.AmfRan)
+				for _, item := range ran.SupportedTAListSnapshot() {
+					if context.InTaiList(item.Tai, taiList) {
+						SendToRan(ran, ngapBuf)
+						break
+					}
+				}
+				return true
+			})
+		}, func() {
+			ue.GmmLog.Warnf("T3513 expires %d times, abort paging procedure", cfg.MaxRetryTimes)
+			ue.T3513 = nil // clear the timer
+			if ue.GetOnGoing(models.ACCESSTYPE__3_GPP_ACCESS).Procedure != context.OnGoingProcedureN2Handover {
+				callback.SendN1N2TransferFailureNotification(ue, models.N1N2MESSAGETRANSFERCAUSE_UE_NOT_RESPONDING)
+			}
+		})
+	}
+}
+
+// TS 23.502 4.2.2.2.3
+// anType: indicate amfUe send this msg for which accessType
+// amfUeNgapID: initial AMF get it from target AMF
+// ngapMessage: initial UE Message to reroute
+// allowedNSSAI: provided by AMF, and AMF get it from NSSF (4.2.2.2.3 step 4b)
+func SendRerouteNasRequest(ue *context.AmfUe, anType models.AccessType, amfUeNgapID *int64, ngapMessage []byte,
+	allowedNSSAI *ngapType.AllowedNSSAI,
+) {
+	if ue == nil {
+		logger.NgapLog.Errorln("AmfUe is nil")
+		return
+	}
+
+	ue.RanUe[anType].Log.Infoln("send Reroute Nas Request")
+
+	if len(ngapMessage) == 0 {
+		ue.RanUe[anType].Log.Errorln("Ngap Message is nil")
+		return
+	}
+
+	pkt, err := BuildRerouteNasRequest(ue, anType, amfUeNgapID, ngapMessage, allowedNSSAI)
+	if err != nil {
+		ue.RanUe[anType].Log.Errorf("build RerouteNasRequest failed: %s", err.Error())
+		return
+	}
+	NasSendToRan(ue, anType, pkt)
+}
+
+// criticality ->from received node when received node can't comprehend the IE or missing IE
+func SendRanConfigurationUpdateAcknowledge(
+	ran *context.AmfRan, criticalityDiagnostics *ngapType.CriticalityDiagnostics,
+) {
+	if ran == nil {
+		logger.NgapLog.Errorln("Ran is nil")
+		return
+	}
+
+	ran.Log.Infoln("send Ran Configuration Update Acknowledge")
+
+	pkt, err := BuildRanConfigurationUpdateAcknowledge(criticalityDiagnostics)
+	if err != nil {
+		ran.Log.Errorf("build RanConfigurationUpdateAcknowledge failed: %s", err.Error())
+		return
+	}
+	SendToRan(ran, pkt)
+}
+
+// criticality ->from received node when received node can't comprehend the IE or missing IE
+// If the AMF cannot accept the update,
+// it shall respond with a RAN CONFIGURATION UPDATE FAILURE message and appropriate cause value.
+func SendRanConfigurationUpdateFailure(ran *context.AmfRan, cause ngapType.Cause,
+	criticalityDiagnostics *ngapType.CriticalityDiagnostics,
+) {
+	if ran == nil {
+		logger.NgapLog.Errorln("Ran is nil")
+		return
+	}
+
+	ran.Log.Infoln("send Ran Configuration Update Failure")
+
+	pkt, err := BuildRanConfigurationUpdateFailure(cause, criticalityDiagnostics)
+	if err != nil {
+		ran.Log.Errorf("build RanConfigurationUpdateFailure failed: %s", err.Error())
+		return
+	}
+	SendToRan(ran, pkt)
+}
+
+// An AMF shall be able to instruct other peer CP NFs, subscribed to receive such a notification,
+// that it will be unavailable on this AMF and its corresponding target AMF(s).
+// If CP NF does not subscribe to receive AMF unavailable notification, the CP NF may attempt
+// forwarding the transaction towards the old AMF and detect that the AMF is unavailable. When
+// it detects unavailable, it marks the AMF and its associated GUAMI(s) as unavailable.
+// Defined in 23.501 5.21.2.2.2
+func SendAMFStatusIndication(ran *context.AmfRan, unavailableGUAMIList ngapType.UnavailableGUAMIList) {
+	if ran == nil {
+		logger.NgapLog.Errorln("Ran is nil")
+		return
+	}
+
+	ran.Log.Infoln("send AMF Status Indication")
+
+	if len(unavailableGUAMIList.List) > context.MaxNumOfServedGuamiList {
+		ran.Log.Errorln("GUAMI List out of range")
+		return
+	}
+
+	pkt, err := BuildAMFStatusIndication(unavailableGUAMIList)
+	if err != nil {
+		ran.Log.Errorf("build AMFStatusIndication failed: %s", err.Error())
+		return
+	}
+	SendToRan(ran, pkt)
+}
+
+// SONConfigurationTransfer = sONConfigurationTransfer from uplink Ran Configuration Transfer
+func SendDownlinkRanConfigurationTransfer(ran *context.AmfRan, transfer *ngapType.SONConfigurationTransfer) {
+	if ran == nil {
+		logger.NgapLog.Errorln("Ran is nil")
+		return
+	}
+
+	ran.Log.Infoln("send Downlink Ran Configuration Transfer")
+
+	pkt, err := BuildDownlinkRanConfigurationTransfer(transfer)
+	if err != nil {
+		ran.Log.Errorf("build DownlinkRanConfigurationTransfer failed: %s", err.Error())
+		return
+	}
+	SendToRan(ran, pkt)
+}
+
+// AOI List is from SMF
+// The SMF may subscribe to the UE mobility event notification from the AMF
+// (e.g. location reporting, UE moving into or out of Area Of Interest) TS 23.502 4.3.2.2.1 Step.17
+// The Location Reporting Control message shall identify the UE for which reports are requested and may include
+// Reporting Type, Location Reporting Level, Area Of Interest and Request Reference ID
+// TS 23.502 4.10 LocationReportingProcedure
+// The AMF may request the NG-RAN location reporting with event reporting type (e.g. UE location or UE presence
+// in Area of Interest), reporting mode and its related parameters (e.g. number of reporting) TS 23.501 5.4.7
+// Location Reference ID To Be Cancelled IE shall be present if the Event Type IE is set to "Stop UE presence
+// in the area of interest". otherwise set it to 0
+func SendLocationReportingControl(
+	ue *context.RanUe,
+	AOIList *ngapType.AreaOfInterestList,
+	LocationReportingReferenceIDToBeCancelled int64,
+	eventType ngapType.EventType,
+) {
+	if ue == nil {
+		logger.NgapLog.Errorln("RanUe is nil")
+		return
+	}
+
+	ue.Log.Infoln("send Location Reporting Control")
+
+	if AOIList != nil && len(AOIList.List) > context.MaxNumOfAOI {
+		ue.Log.Errorln("AOI List out of range")
+		return
+	}
+
+	if eventType.Value == ngapType.EventTypePresentStopUePresenceInAreaOfInterest {
+		if LocationReportingReferenceIDToBeCancelled < 1 || LocationReportingReferenceIDToBeCancelled > 64 {
+			ue.Log.Errorln("LocationReportingReferenceIDToBeCancelled out of range (should be 1 ~ 64)")
+			return
+		}
+	}
+
+	pkt, err := BuildLocationReportingControl(ue, AOIList, LocationReportingReferenceIDToBeCancelled, eventType)
+	if err != nil {
+		ue.Log.Errorf("build LocationReportingControl failed: %s", err.Error())
+		return
+	}
+	SendToRanUe(ue, pkt)
+}

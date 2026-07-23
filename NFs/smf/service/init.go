@@ -1,0 +1,329 @@
+// SPDX-FileCopyrightText: 2022-present Intel Corporation
+// SPDX-FileCopyrightText: 2021 Open Networking Foundation <info@opennetworking.org>
+// Copyright 2019 free5GC.org
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package service
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	_ "net/http/pprof" // Using package only for invoking initialization.
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
+
+	nasLogger "github.com/omec-project/nas/v2/logger"
+	ngapLogger "github.com/omec-project/ngap/v2/logger"
+	openapiLogger "github.com/omec-project/openapi/v2/logger"
+	"github.com/omec-project/openapi/v2/models"
+	"github.com/omec-project/openapi/v2/nfConfigApi"
+	nrfCache "github.com/omec-project/openapi/v2/nrfcache"
+	"github.com/omec-project/smf/callback"
+	"github.com/omec-project/smf/consumer"
+	smfContext "github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/eventexposure"
+	"github.com/omec-project/smf/factory"
+	"github.com/omec-project/smf/logger"
+	"github.com/omec-project/smf/metrics"
+	"github.com/omec-project/smf/nfregistration"
+	"github.com/omec-project/smf/oam"
+	"github.com/omec-project/smf/pdusession"
+	"github.com/omec-project/smf/pfcp"
+	"github.com/omec-project/smf/pfcp/message"
+	"github.com/omec-project/smf/pfcp/udp"
+	"github.com/omec-project/smf/pfcp/upf"
+	"github.com/omec-project/smf/polling"
+	"github.com/omec-project/util/http2_util"
+	utilLogger "github.com/omec-project/util/logger"
+	"github.com/urfave/cli/v3"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+type SMF struct{}
+
+type (
+	// Config information.
+	Config struct {
+		cfg       string
+		uerouting string
+	}
+)
+
+var config Config
+
+var smfCLi = []cli.Flag{
+	&cli.StringFlag{
+		Name:     "cfg",
+		Usage:    "smf config file",
+		Required: true,
+	},
+	&cli.StringFlag{
+		Name:     "uerouting",
+		Usage:    "uerouting config file",
+		Required: true,
+	},
+}
+
+func (*SMF) GetCliCmd() (flags []cli.Flag) {
+	return smfCLi
+}
+
+func (smf *SMF) Initialize(c *cli.Command) error {
+	config = Config{
+		cfg:       c.String("cfg"),
+		uerouting: c.String("uerouting"),
+	}
+
+	absPath, err := filepath.Abs(config.cfg)
+	if err != nil {
+		logger.CfgLog.Errorln(err)
+		return err
+	}
+
+	if err = factory.InitConfigFactory(absPath); err != nil {
+		return err
+	}
+
+	factory.SmfConfig.CfgLocation = absPath
+
+	ueRoutingPath, err := filepath.Abs(config.uerouting)
+	if err != nil {
+		logger.CfgLog.Errorln(err)
+		return err
+	}
+
+	if err := factory.InitRoutingConfigFactory(ueRoutingPath); err != nil {
+		return err
+	}
+
+	smf.setLogLevel()
+
+	if err := factory.CheckConfigVersion(); err != nil {
+		return err
+	}
+
+	// Initiating a server for profiling
+	if factory.SmfConfig.Configuration.DebugProfilePort != 0 {
+		addr := fmt.Sprintf(":%d", factory.SmfConfig.Configuration.DebugProfilePort)
+		go func() {
+			err := http.ListenAndServe(addr, nil)
+			if err != nil {
+				logger.InitLog.Warnf("start profiling server failed: %+v", err)
+			}
+		}()
+	}
+	return nil
+}
+
+func (smf *SMF) setLogLevel() {
+	cfgLogger := factory.SmfConfig.Logger
+	if cfgLogger == nil {
+		logger.InitLog.Warnln("SMF config without log level setting, defaulting to `info`")
+		return
+	}
+
+	setModuleLogLevel(cfgLogger, cfgLogger.SMF, logger.InitLog, logger.SetLogLevel)
+	setModuleLogLevel(cfgLogger, cfgLogger.NAS, nasLogger.NasLog, nasLogger.SetLogLevel)
+	setModuleLogLevel(cfgLogger, cfgLogger.NGAP, ngapLogger.NgapLog, ngapLogger.SetLogLevel)
+	setModuleLogLevel(cfgLogger, cfgLogger.OpenApi, openapiLogger.OpenapiLog, openapiLogger.SetLogLevel)
+	setModuleLogLevel(cfgLogger, cfgLogger.Util, utilLogger.UtilLog, utilLogger.SetLogLevel)
+
+	// Initialize Statistics
+	go metrics.InitMetrics()
+}
+
+func (smf *SMF) Start() {
+	logger.InitLog.Infoln("SMF app initialising")
+
+	// Init SMF Context
+	smfCtxt := smfContext.InitSmfContext(&factory.SmfConfig)
+
+	if smfCtxt == nil {
+		logger.InitLog.Errorln("SMF context init failed")
+		return
+	}
+
+	// Init UE Specific Config
+	smfContext.InitSMFUERouting(&factory.UERoutingConfig)
+
+	// Init Kafka stream before spawning goroutines that may publish metric events.
+	if err := metrics.InitialiseKafkaStream(factory.SmfConfig.Configuration); err != nil {
+		logger.InitLog.Errorf("initialise kafka stream failed, %v", err)
+	}
+
+	if smfCtxt.EnableNrfCaching {
+		logger.InitLog.Infof("enable NRF caching feature for %d seconds", smfCtxt.NrfCacheEvictionInterval)
+		nrfCache.InitNrfCaching(smfCtxt.NrfCacheEvictionInterval*time.Second, consumer.SendNrfForNfInstance)
+	}
+
+	registrationChan := make(chan []nfConfigApi.SessionManagement, 100)
+	contextUpdateChan := make(chan []nfConfigApi.SessionManagement, 100)
+	ctx, cancelServices := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signalChannel
+		smf.Terminate(cancelServices, &wg)
+		os.Exit(0)
+	}()
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		polling.StartPollingService(
+			ctx,
+			factory.SmfConfig.Configuration.WebuiUri,
+			registrationChan,
+			contextUpdateChan,
+		)
+	}()
+
+	go func() {
+		defer wg.Done()
+		nfregistration.StartNfRegistrationService(ctx, registrationChan)
+	}()
+
+	smfSelf := smfContext.SMF_Self()
+	// Update SMF context using polled config
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				logger.InitLog.Infoln("received cancellation signal. Shutting down context update routine")
+				return
+			case cfg := <-contextUpdateChan:
+				factory.SmfConfigSyncLock.Lock()
+				err := smfContext.UpdateSmfContext(smfSelf, cfg)
+				factory.SmfConfigSyncLock.Unlock()
+				if err != nil {
+					logger.PollConfigLog.Errorf("SMF context update failed: %v", err)
+					continue
+				}
+				logger.PollConfigLog.Debugln("SMF context updated from WebConsole config")
+				smfContext.AllocateUPFID()
+				logger.AppLog.Debugf("UserPlaneInformation: %+v", smfSelf.UserPlaneInformation)
+				if smfSelf.UserPlaneInformation != nil && smfSelf.UserPlaneInformation.UPFs != nil {
+					for _, upfNode := range smfSelf.UserPlaneInformation.UPFs {
+						logger.AppLog.Debugf("UPF: %+v", upfNode)
+						if upfNode == nil {
+							continue
+						}
+
+						if upfNode.UPF.UPFStatus != smfContext.AssociatedSetUpSuccess {
+							nodeID := upfNode.NodeID.ResolveNodeIdToIp()
+							if nodeID == nil {
+								logger.AppLog.Warnf("failed to resolve NodeId for UPF %v", upfNode)
+								continue
+							}
+
+							err = message.SendPfcpAssociationSetupRequest(upfNode.NodeID, upfNode.Port)
+							if err != nil {
+								logger.AppLog.Warnf("failed to send PFCP Association Setup Request to UPF %v: %v", upfNode, err)
+							} else {
+								logger.AppLog.Infof("PFCP Association Setup Request sent to UPF %v", upfNode)
+							}
+							upfNode.UPF.UpfLock.Lock()
+							upfNode.UPF.UPFStatus = smfContext.AssociatedSetUpSuccess
+							upfNode.UPF.UpfLock.Unlock()
+
+							logger.AppLog.Infof("UPF %v status updated to AssociatedSetUpSuccess", upfNode)
+						} else {
+							logger.AppLog.Debugf("UPF %v already associated, skipping PFCP request", upfNode)
+						}
+					}
+				} else {
+					logger.AppLog.Warnln("UserPlaneInformation is nil, skipping PFCP association")
+				}
+			}
+		}
+	}()
+	go func() {
+		logger.InitLog.Infoln("InitPfcpAssociationRequest")
+		go upf.InitPfcpHeartbeatRequest()
+		go upf.ProbeInactiveUpfs()
+	}()
+	router := utilLogger.NewGinWithZap(logger.GinLog)
+	oam.AddService(router)
+	callback.AddService(router)
+	for _, serviceName := range factory.SmfConfig.Configuration.ServiceNameList {
+		switch models.ServiceName(serviceName) {
+		case models.SERVICENAME_NSMF_PDUSESSION:
+			pdusession.AddService(router)
+		case models.SERVICENAME_NSMF_EVENT_EXPOSURE:
+			eventexposure.AddService(router)
+		}
+	}
+
+	if factory.SmfConfig.Configuration.EnableDbStore {
+		logger.InitLog.Infoln("SetupSmfCollection")
+		smfContext.SetupSmfCollection()
+		// Init DRSM for unique FSEID/FTEID
+		if err := smfCtxt.InitDrsm(); err != nil {
+			logger.InitLog.Errorf("initialise drsm failed, %+v", err)
+		}
+	} else {
+		logger.InitLog.Infoln("DB is disabled, not initialising drsm")
+	}
+
+	udp.Run(pfcp.Dispatch)
+	time.Sleep(1000 * time.Millisecond)
+
+	HTTPAddr := fmt.Sprintf("%s:%d", smfSelf.BindingIPv4, smfSelf.SBIPort)
+	sslLog := filepath.Dir(factory.SmfConfig.CfgLocation) + "/sslkey.log"
+	server, err := http2_util.NewServer(HTTPAddr, sslLog, router)
+	if server == nil || err != nil {
+		logger.InitLog.Errorf("initialize HTTP server failed: %v", err)
+		return
+	}
+
+	serverScheme := factory.SmfConfig.Configuration.Sbi.Scheme
+	switch serverScheme {
+	case "http":
+		err = server.ListenAndServe()
+	case "https":
+		err = server.ListenAndServeTLS(smfSelf.PEM, smfSelf.Key)
+	default:
+		logger.InitLog.Fatalf("HTTP server setup failed: invalid server scheme %+v", serverScheme)
+		return
+	}
+
+	if err != nil {
+		logger.InitLog.Fatalln("HTTP server setup failed:", err)
+	}
+}
+
+func (smf *SMF) Terminate(cancelServices context.CancelFunc, wg *sync.WaitGroup) {
+	logger.InitLog.Infoln("terminating SMF")
+	cancelServices()
+	nfregistration.DeregisterNF()
+	wg.Wait()
+	logger.InitLog.Infoln("SMF terminated")
+}
+
+// setModuleLogLevel is a helper to reduce repetition in log level setup
+func setModuleLogLevel(logger *utilLogger.Logger, moduleCfg *utilLogger.LogSetting, logObj *zap.SugaredLogger, setLevel func(zapcore.Level)) {
+	moduleName, err := utilLogger.GetLogSettingName(logger, moduleCfg)
+	if err != nil {
+		logObj.Errorf("could not determine module name: %v", err)
+		return
+	}
+	if moduleCfg == nil || moduleCfg.DebugLevel == "" {
+		logObj.Warnf("%s Log level not set. Default setting to [info] level", moduleName)
+		setLevel(zap.InfoLevel)
+		return
+	}
+	level, err := zapcore.ParseLevel(moduleCfg.DebugLevel)
+	if err != nil {
+		logObj.Warnf("%s Log level [%s] is invalid, setting to [%s] level", moduleName, moduleCfg.DebugLevel, level.String())
+	}
+	setLevel(level)
+}
