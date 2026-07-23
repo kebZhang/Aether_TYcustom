@@ -1,0 +1,19 @@
+# ============================================================
+# Aether_TYcustm .gitignore
+# ============================================================
+
+# docker_images/ 中转目录：忽略其下所有子文件夹和 tar 镜像（编译产物，体积大，可重新生成）
+# 但保留 docker_images/README.md 本身入库。
+docker_images/**
+!docker_images/
+!docker_images/README.md
+
+# 编译产物 / 临时文件
+_out/
+vendor/
+*.tar
+*.log
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
